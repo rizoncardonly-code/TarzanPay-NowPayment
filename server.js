@@ -1,139 +1,263 @@
-const express = require('express');
-const admin = require('firebase-admin');
-const cors = require('cors');
-const axios = require('axios');
-const crypto = require('crypto');
+// ==========================================================
+//  Tarzan Pay — NOWPayments TON Backend
+//  Deploy on Render.com  •  Node.js 18+
+//  Minimum deposit: $0.5
+// ==========================================================
+import express from 'express';
+import cors from 'cors';
+import fetch from 'node-fetch';
+import crypto from 'crypto';
+import admin from 'firebase-admin';
 
 const app = express();
-app.use(express.json());
 app.use(cors());
+app.use(express.json({ limit: '1mb' }));
 
-// ফায়ারবেস সার্ভিস অ্যাকাউন্ট কানেক্ট করা (serviceAccountKey.json ফাইল ফোল্ডারে থাকতে হবে)
-const serviceAccount = require('./serviceAccountKey.json');
+// ========== 🔐 CONFIG ==========
+const NOWPAYMENTS_API_KEY   = process.env.NOWPAYMENTS_API_KEY;
+const NOWPAYMENTS_IPN_KEY   = process.env.NOWPAYMENTS_IPN_KEY;
+const SHARED_API_KEY        = process.env.SHARED_API_KEY;
+const FIREBASE_SERVICE_JSON = process.env.FIREBASE_SERVICE_JSON;
+const PUBLIC_URL            = process.env.PUBLIC_URL || '';
+const NOWPAYMENTS_API       = 'https://api.nowpayments.io/v1';
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: "https://tarzan-pay-ok-default-rtdb.firebaseio.com" // 👉 আপনার ফায়ারবেস ডেটাবেস ইউআরএল এখানে দিন
-});
+const MIN_DEPOSIT_USD = 0.5;
+const MAX_DEPOSIT_USD = 10000;
 
+// ========== 🔥 Firebase Admin Init ==========
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(JSON.parse(FIREBASE_SERVICE_JSON)),
+    databaseURL: 'https://tarzan-pay-ok-default-rtdb.firebaseio.com'
+  });
+}
 const db = admin.database();
 
-// কনফিগারেশন
-const NOWPAYMENTS_API_KEY = '8MV8F0J-VB2MQ56-MWM2RCV-F8XBD9P'; // 👉 আপনার NOWPayments API Key এখানে দিন
-const IPN_SECRET = 'oKxHubU50XWxZhEWrzO4aUZcKyKQDXBv';     // 👉 আপনার NOWPayments IPN Secret এখানে দিন
-const RENDER_SERVER_URL = 'https://tarzanpay-nowpayment.onrender.com';
-
-// ১. পেমেন্ট ইনভয়েস তৈরির এপিআই (ইউজার অ্যাপ থেকে কল হবে)
-app.post('/api/create-payment', async (req, res) => {
-  const { userId, amount } = req.body;
-  
-  if (!userId || !amount || amount <= 0) {
-    return res.status(400).json({ success: false, message: 'Invalid user or amount' });
+// ========== 🛡️ Auth Middleware ==========
+function requireApiKey(req, res, next) {
+  const key = req.header('x-api-key');
+  if (!key || key !== SHARED_API_KEY) {
+    return res.status(401).json({ success: false, message: 'Unauthorized' });
   }
+  next();
+}
 
+// ========== 🧰 Helpers ==========
+function sortObject(obj) {
+  if (Array.isArray(obj)) return obj.map(sortObject);
+  if (obj && typeof obj === 'object') {
+    return Object.keys(obj).sort().reduce((acc, k) => {
+      acc[k] = sortObject(obj[k]);
+      return acc;
+    }, {});
+  }
+  return obj;
+}
+
+function isValidUserId(id) {
+  return typeof id === 'string' && id.length >= 3 && id.length <= 32 && /^[A-Za-z0-9_-]+$/.test(id);
+}
+
+// ==========================================================
+// 1️⃣ Create Payment (TON)
+// ==========================================================
+app.post('/api/create-payment', requireApiKey, async (req, res) => {
   try {
-    const response = await axios.post('https://api.nowpayments.io/v1/invoice', {
-      price_amount: amount,
-      price_currency: 'usd',               // ডলারে অ্যামাউন্ট হিসাব হবে
-      pay_currency: 'usdtbsc',             // USDT on Binance Smart Chain (BSC/BEP20)
-      ipn_callback_url: `${RENDER_SERVER_URL}/api/nowpayments-ipn`,
-      order_id: userId,
-      order_description: `Deposit for Tarzan Pay User ID: ${userId}`
-    }, {
+    const { userId, amount, returnUrl, cancelUrl } = req.body || {};
+
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid userId' });
+    }
+
+    const amt = Number(amount);
+    if (!amt || isNaN(amt)) {
+      return res.status(400).json({ success: false, message: 'Amount required' });
+    }
+    if (amt < MIN_DEPOSIT_USD) {
+      return res.status(400).json({
+        success: false,
+        message: `Minimum deposit is $${MIN_DEPOSIT_USD}`
+      });
+    }
+    if (amt > MAX_DEPOSIT_USD) {
+      return res.status(400).json({
+        success: false,
+        message: `Maximum deposit is $${MAX_DEPOSIT_USD}`
+      });
+    }
+
+    const orderId = `TP_${userId}_${Date.now()}`;
+
+    const body = {
+      price_amount: amt,
+      price_currency: 'usd',
+      pay_currency: 'ton',                  // 🔥 TON (Toncoin)
+      order_id: orderId,
+      order_description: `Tarzan Pay deposit for user ${userId}`,
+      ipn_callback_url: `${PUBLIC_URL}/api/webhook`,
+      success_url: returnUrl || `${PUBLIC_URL}/?deposit=success`,
+      cancel_url: cancelUrl || `${PUBLIC_URL}/?deposit=cancel`
+    };
+
+    const r = await fetch(`${NOWPAYMENTS_API}/payment`, {
+      method: 'POST',
       headers: {
         'x-api-key': NOWPAYMENTS_API_KEY,
         'Content-Type': 'application/json'
-      }
+      },
+      body: JSON.stringify(body)
     });
 
-    return res.status(200).json({ 
-      success: true, 
-      paymentURL: response.data.invoice_url 
+    const data = await r.json();
+
+    if (!r.ok || !data.payment_id) {
+      console.error('NOWPayments error:', data);
+      return res.status(500).json({
+        success: false,
+        message: data.message || 'Payment creation failed'
+      });
+    }
+
+    await db.ref(`users/${userId}/pendingDeposits/${data.payment_id}`).set({
+      paymentId: data.payment_id,
+      orderId,
+      amount: amt,
+      payAddress: data.pay_address || '',
+      payAmount: data.pay_amount || 0,
+      payCurrency: 'ton',
+      status: 'pending',
+      createdAt: Date.now()
     });
-  } catch (error) {
-    console.error('Payment Error:', error.response?.data || error.message);
-    return res.status(500).json({ success: false, message: 'Failed to create payment gateway' });
+
+    return res.json({
+      success: true,
+      paymentId: data.payment_id,
+      paymentURL: data.invoice_url || `https://nowpayments.io/payment/?iid=${data.payment_id}`,
+      payAddress: data.pay_address || '',
+      payAmount: data.pay_amount || 0
+    });
+
+  } catch (err) {
+    console.error('create-payment error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-// ২. NOWPayments Webhook / IPN API (পেমেন্ট সম্পন্ন হলে অটো ব্যালেন্স যোগ হবে)
-app.post('/api/nowpayments-ipn', async (req, res) => {
+// ==========================================================
+// 2️⃣ Check Payment Status
+// ==========================================================
+app.get('/api/status/:paymentId', requireApiKey, async (req, res) => {
   try {
-    // নিরাপত্তা যাচাইয়ের জন্য IPN Sig চেক করা (ঐচ্ছিক কিন্তু সুরক্ষিত)
-    const sigHeader = req.headers['x-nowpayments-sig'];
-    if (IPN_SECRET && sigHeader) {
-      const hmac = crypto.createHmac('sha512', IPN_SECRET);
-      // রিকোয়েস্ট বডি সর্ট করে সিগনেচার মেলানো হয়
-      function sortObject(o) {
-        return Object.keys(o).sort().reduce((acc, key) => {
-          if (o[key] !== null && typeof o[key] === 'object' && !Array.isArray(o[key])) {
-            acc[key] = sortObject(o[key]);
-          } else {
-            acc[key] = o[key];
-          }
-          return acc;
-        }, {});
-      }
-      const sortedPayload = JSON.stringify(sortObject(req.body));
-      hmac.update(sortedPayload);
-      const computedSig = hmac.digest('hex');
-      
-      if (computedSig !== sigHeader) {
-        console.warn('Warning: IPN signature mismatch!');
-      }
+    const { paymentId } = req.params;
+    if (!paymentId) {
+      return res.status(400).json({ success: false, message: 'paymentId required' });
     }
 
-    const paymentData = req.body;
-    console.log('IPN Received:', paymentData);
+    const r = await fetch(`${NOWPAYMENTS_API}/payment/${paymentId}`, {
+      headers: { 'x-api-key': NOWPAYMENTS_API_KEY }
+    });
+    const data = await r.json();
 
-    // পেমেন্ট স্ট্যাটাস 'finished' বা 'confirmed' হলে ব্যালেন্স যুক্ত হবে
-    if (paymentData.payment_status === 'finished' || paymentData.payment_status === 'confirmed') {
-      const userId = paymentData.order_id;
-      const amount = Number(paymentData.price_amount);
-      const paymentId = paymentData.payment_id;
-
-      const depositRef = db.ref('deposits/' + paymentId);
-      const snap = await depositRef.once('value');
-
-      // চেক করা হচ্ছে ট্রানজাকশনটি আগে প্রসেস হয়েছে কি না
-      if (!snap.exists()) {
-        // ফায়ারবেসে ডিপোজিট রেকর্ড সেভ করা
-        await depositRef.set({
-          paymentId,
-          userId,
-          amount,
-          status: 'success',
-          timestamp: Date.now()
-        });
-
-        // ইউজারের ফায়ারবেস ব্যালেন্স স্বয়ংক্রিয়ভাবে আপডেট করা
-        const userRef = db.ref('users/' + userId);
-        const userSnap = await userRef.once('value');
-        
-        if (userSnap.exists()) {
-          const userData = userSnap.val();
-          const currentBalance = Number(userData.balance || 0);
-          const totalEarned = Number(userData.totalEarned || 0);
-
-          await userRef.update({
-            balance: currentBalance + amount,
-            totalEarned: totalEarned + amount
-          });
-          
-          console.log(`Balance credited successfully for user ${userId}: +${amount}`);
-        }
-      }
+    if (!r.ok) {
+      return res.status(r.status).json({ success: false, message: data.message || 'Not found' });
     }
 
-    return res.status(200).send({ success: true });
-  } catch (error) {
-    console.error('IPN Processing Error:', error);
-    return res.status(500).send({ success: false, error: error.message });
+    return res.json({
+      success: true,
+      paymentId: data.payment_id,
+      status: data.payment_status,
+      amount: data.price_amount,
+      payAmount: data.actually_paid || data.pay_amount,
+      payCurrency: data.pay_currency || 'ton'
+    });
+
+  } catch (err) {
+    console.error('status error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-// সার্ভার স্টার্ট
+// ==========================================================
+// 3️⃣ Webhook (IPN)
+// ==========================================================
+app.post('/api/webhook', async (req, res) => {
+  try {
+    const sig = req.header('x-nowpayments-sig');
+    if (NOWPAYMENTS_IPN_KEY && sig) {
+      const sorted = JSON.stringify(sortObject(req.body));
+      const hmac = crypto.createHmac('sha512', NOWPAYMENTS_IPN_KEY).update(sorted).digest('hex');
+      if (hmac !== sig) {
+        console.warn('⚠️ Invalid webhook signature');
+        return res.status(401).send('Invalid signature');
+      }
+    }
+
+    const { payment_id, payment_status, order_id, price_amount } = req.body;
+    if (!payment_id) return res.status(400).send('Missing payment_id');
+
+    const parts = (order_id || '').split('_');
+    const userId = parts.length >= 2 ? parts[1] : null;
+    if (!userId) return res.status(400).send('Missing userId');
+
+    const status = String(payment_status || '').toLowerCase();
+
+    await db.ref(`users/${userId}/pendingDeposits/${payment_id}`).update({
+      status,
+      webhookAt: Date.now(),
+      actuallyPaid: req.body.actually_paid || null
+    });
+
+    if (status === 'finished' || status === 'confirmed') {
+      const amt = Number(price_amount || 0);
+      if (amt <= 0) return res.send('ok');
+
+      const existing = await db.ref(`users/${userId}/deposits/${payment_id}`).once('value');
+      if (existing.exists()) {
+        console.log('⚠️ Deposit already credited:', payment_id);
+        return res.send('ok');
+      }
+
+      await db.ref(`users/${userId}/deposits/${payment_id}`).set({
+        paymentId: payment_id,
+        orderId: order_id,
+        amount: amt,
+        payCurrency: 'ton',
+        status: 'credited',
+        createdAt: Date.now(),
+        creditedAt: Date.now()
+      });
+
+      await db.ref(`users/${userId}/balance`).transaction(cur => Number(cur || 0) + amt);
+      await db.ref(`users/${userId}/pendingDeposits/${payment_id}`).remove();
+
+      await db.ref(`users/${userId}/notifications`).push({
+        title: 'Deposit Credited ✅',
+        text: `Your TON deposit of $${amt.toFixed(2)} has been credited to your balance.`,
+        status: 'success',
+        txId: payment_id,
+        timestamp: Date.now()
+      });
+
+      console.log(`✅ Credited $${amt} to user ${userId} (payment ${payment_id})`);
+    }
+
+    return res.send('ok');
+
+  } catch (err) {
+    console.error('webhook error:', err);
+    return res.status(500).send('error');
+  }
+});
+
+// ==========================================================
+// 4️⃣ Health Check
+// ==========================================================
+app.get('/', (req, res) => {
+  res.send('Tarzan Pay TON deposit API is running ✅');
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Tarzan Pay Backend is running on port ${PORT}`);
+  console.log(`✅ Tarzan Pay TON server running on port ${PORT}`);
+  console.log(`   Min deposit: $${MIN_DEPOSIT_USD} | Max: $${MAX_DEPOSIT_USD}`);
 });
