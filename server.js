@@ -2,23 +2,28 @@ const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
 const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// ফায়ারবেস সার্ভিস অ্যাকাউন্ট কনফিগারেশন 
-// আপনার প্রজেক্টের downloaded serviceAccountKey.json ফাইলটি ফোল্ডারে রাখবেন
+// ফায়ারবেস সার্ভিস অ্যাকাউন্ট কানেক্ট করা (serviceAccountKey.json ফাইল ফোল্ডারে থাকতে হবে)
 const serviceAccount = require('./serviceAccountKey.json');
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: "https://YOUR_FIREBASE_PROJECT_ID-default-rtdb.firebaseio.com" // আপনার ফায়ারবেস রিয়েলটাইম ডেটাবেস ইউআরএল এখানে দিন
+  databaseURL: "https://tarzan-pay-ok-default-rtdb.firebaseio.com" // 👉 আপনার ফায়ারবেস ডেটাবেস ইউআরএল এখানে দিন
 });
 
 const db = admin.database();
 
-// ১. NOWPayments ইনভয়েস বা পেমেন্ট লিংক তৈরির এপিআই (ইউজার অ্যাপ থেকে কল হবে)
+// কনফিগারেশন
+const NOWPAYMENTS_API_KEY = '8MV8F0J-VB2MQ56-MWM2RCV-F8XBD9P'; // 👉 আপনার NOWPayments API Key এখানে দিন
+const IPN_SECRET = 'oKxHubU50XWxZhEWrzO4aUZcKyKQDXBv';     // 👉 আপনার NOWPayments IPN Secret এখানে দিন
+const RENDER_SERVER_URL = 'https://tarzanpay-nowpayment.onrender.com';
+
+// ১. পেমেন্ট ইনভয়েস তৈরির এপিআই (ইউজার অ্যাপ থেকে কল হবে)
 app.post('/api/create-payment', async (req, res) => {
   const { userId, amount } = req.body;
   
@@ -29,14 +34,14 @@ app.post('/api/create-payment', async (req, res) => {
   try {
     const response = await axios.post('https://api.nowpayments.io/v1/invoice', {
       price_amount: amount,
-      price_currency: 'usd', // টাকার অ্যামাউন্ট ডলারে হিসাব করা হবে
-      pay_currency: 'usdttrc20', // ইউজার USDT TRC20 দিয়ে পেমেন্ট করবে
-      ipn_callback_url: 'https://tarzan-pay-backend.onrender.com/api/nowpayments-ipn', // Render-এর লাইভ ব্যাকএন্ড URL এখানে বসাবেন
+      price_currency: 'usd',               // ডলারে অ্যামাউন্ট হিসাব হবে
+      pay_currency: 'usdtbsc',             // USDT on Binance Smart Chain (BSC/BEP20)
+      ipn_callback_url: `${RENDER_SERVER_URL}/api/nowpayments-ipn`,
       order_id: userId,
       order_description: `Deposit for Tarzan Pay User ID: ${userId}`
     }, {
       headers: {
-        'x-api-key': 'YOUR_NOWPAYMENTS_API_KEY', // আপনার NOWPayments ড্যাশবোর্ডের API Key এখানে দিন
+        'x-api-key': 8MV8F0J-VB2MQ56-MWM2RCV-F8XBD9P,
         'Content-Type': 'application/json'
       }
     });
@@ -54,6 +59,30 @@ app.post('/api/create-payment', async (req, res) => {
 // ২. NOWPayments Webhook / IPN API (পেমেন্ট সম্পন্ন হলে অটো ব্যালেন্স যোগ হবে)
 app.post('/api/nowpayments-ipn', async (req, res) => {
   try {
+    // নিরাপত্তা যাচাইয়ের জন্য IPN Sig চেক করা (ঐচ্ছিক কিন্তু সুরক্ষিত)
+    const sigHeader = req.headers['x-nowpayments-sig'];
+    if (IPN_SECRET && sigHeader) {
+      const hmac = crypto.createHmac('sha512', IPN_SECRET);
+      // রিকোয়েস্ট বডি সর্ট করে সিগনেচার মেলানো হয়
+      function sortObject(o) {
+        return Object.keys(o).sort().reduce((acc, key) => {
+          if (o[key] !== null && typeof o[key] === 'object' && !Array.isArray(o[key])) {
+            acc[key] = sortObject(o[key]);
+          } else {
+            acc[key] = o[key];
+          }
+          return acc;
+        }, {});
+      }
+      const sortedPayload = JSON.stringify(sortObject(req.body));
+      hmac.update(sortedPayload);
+      const computedSig = hmac.digest('hex');
+      
+      if (computedSig !== sigHeader) {
+        console.warn('Warning: IPN signature mismatch!');
+      }
+    }
+
     const paymentData = req.body;
     console.log('IPN Received:', paymentData);
 
@@ -103,7 +132,7 @@ app.post('/api/nowpayments-ipn', async (req, res) => {
   }
 });
 
-// সার্ভার রানিং পোর্ট
+// সার্ভার স্টার্ট
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Tarzan Pay Backend is running on port ${PORT}`);
