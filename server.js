@@ -41,7 +41,7 @@ app.post('/api/create-payment', async (req, res) => {
       order_description: `Deposit for Tarzan Pay User ID: ${userId}`
     }, {
       headers: {
-        'x-api-key': 8MV8F0J-VB2MQ56-MWM2RCV-F8XBD9P,
+        'x-api-key': NOWPAYMENTS_API_KEY,
         'Content-Type': 'application/json'
       }
     });
